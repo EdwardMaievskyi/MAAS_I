@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional, Literal
 class Task(BaseModel):
     id: str
     agent_name: Literal["OrchestratorAgent", "SearchAgent", "CodeAgent"]
-    action: str # e.g., "search", "generate_code", "install_libraries", "execute_code"
+    action: str
     details: Dict[str, Any] = Field(default_factory=dict)
     status: Literal["pending", "in_progress", "completed", "failed"] = "pending"
     result: Optional[Any] = None

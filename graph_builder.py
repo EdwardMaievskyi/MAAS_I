@@ -35,14 +35,42 @@ def task_router_node(state: AgentState) -> AgentState:
         task_just_processed = next((task for task in state.plan if task.id == state.current_task_id), None)
         if task_just_processed:
             state.executed_tasks_log.append(task_just_processed.model_copy(deep=True))
-            # If a task failed, the orchestrator might need to re-plan or halt.
-            # For now, we continue the plan unless a critical error is set on state.error_message.
-            if task_just_processed.status == "failed" and not state.error_message:
-                state.error_message = f"Task {task_just_processed.id} ({task_just_processed.action}) failed: {task_just_processed.error}"
+            # If a task failed, analyze the error and decide if re-planning is needed
+            if task_just_processed.status == "failed":
+                print(f"ROUTER: Task {task_just_processed.id} ({task_just_processed.action}) failed: {task_just_processed.error}")
+                
+                # Determine if this error requires re-planning
+                critical_error_keywords = ["permission denied", "not found", "invalid input", "missing data"]
+                is_critical_error = any(keyword in task_just_processed.error.lower() for keyword in critical_error_keywords) if task_just_processed.error else False
+                
+                # Check if this is a search or code generation failure that might benefit from re-planning
+                is_recoverable_failure = (
+                    (task_just_processed.agent_name == "SearchAgent" and task_just_processed.action == "perform_search") or
+                    (task_just_processed.agent_name == "CodeAgent" and task_just_processed.action in ["generate_code", "execute_code"])
+                )
+                
+                # If this is a critical error or a recoverable failure, consider re-planning
+                if is_critical_error or is_recoverable_failure:
+                    print("ROUTER: Critical or recoverable error detected. Triggering re-planning.")
+                    state.error_message = f"Task {task_just_processed.id} failed: {task_just_processed.error}. Re-planning required."
+                    state.next_node_to_call = "orchestrator_planner"  # Go back to planning
+                    return state
+                else:
+                    # Non-critical error, continue with plan but note the error
+                    state.error_message = f"Task {task_just_processed.id} ({task_just_processed.action}) failed: {task_just_processed.error}"
 
     next_pending_task = next((task for task in state.plan if task.status == "pending"), None)
 
-    if state.error_message and not next_pending_task: # If an error occurred and no more tasks, or major planning error
+    # If we have an error message but still have pending tasks, assess if we should continue or re-plan
+    if state.error_message and next_pending_task:
+        # Check if we've had multiple failures that suggest we need a new approach
+        failed_tasks_count = sum(1 for task in state.executed_tasks_log if task.status == "failed")
+        if failed_tasks_count >= 2:  # If we've had multiple failures, consider re-planning
+            print(f"ROUTER: Multiple failures detected ({failed_tasks_count}). Triggering re-planning.")
+            state.next_node_to_call = "orchestrator_planner"
+            return state
+
+    if state.error_message and not next_pending_task:  # If an error occurred and no more tasks
         print(f"ROUTER: Error occurred ('{state.error_message}') or plan ended with error. Proceeding to final response.")
         state.next_node_to_call = "final_response_node"
         return state
@@ -60,11 +88,11 @@ def task_router_node(state: AgentState) -> AgentState:
         else:
             print(f"ROUTER: Unknown agent/action: {agent_name}/{action_name}. Ending.")
             state.error_message = f"Router error: Unknown agent or action '{agent_name}/{action_name}'."
-            state.next_node_to_call = "final_response_node" # Go to finalize with error
-            if state.current_task_id: # Mark current task as failed
+            state.next_node_to_call = "final_response_node"  # Go to finalize with error
+            if state.current_task_id:
                 next_pending_task.status = "failed"
                 next_pending_task.error = state.error_message
-                state.executed_tasks_log.append(next_pending_task.copy(deep=True))
+                state.executed_tasks_log.append(next_pending_task.model_copy(deep=True))
     else:
         print("ROUTER: Plan complete. Proceeding to final response.")
         state.next_node_to_call = "final_response_node"
@@ -85,18 +113,18 @@ def create_graph():
     workflow.add_node("final_response_node", final_response_node)
 
     workflow.set_entry_point("orchestrator_planner")
-    
+
     workflow.add_edge("orchestrator_planner", "task_router")
 
     def route_logic(state: AgentState):
         if state.next_node_to_call == "__end__":
             return END
-        return state.next_node_to_call  # This will be the name of the next node to execute
+        return state.next_node_to_call
 
     for agent, actions in AGENT_ACTION_MAP.items():
         for action in actions.keys():
             workflow.add_edge(f"{agent}_{action}", "task_router")
-            
+
     workflow.add_conditional_edges(
         "task_router",
         route_logic,
