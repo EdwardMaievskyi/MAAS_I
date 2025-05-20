@@ -16,6 +16,7 @@ try:
 except docker.errors.DockerException:
     print("TOOL_SHED: Docker is not running or accessible. Code Agent will not function.")
 
+
 def build_docker_image_once():
     """Builds the Docker image for the Code Agent if it doesn't exist."""
     if not docker_client:
@@ -87,7 +88,7 @@ def install_libraries(libraries: List[str]) -> Dict[str, Any]:
             remove=False   # We need to commit this container
         )
         logs = container.logs().decode('utf-8')
-        
+
         # Check if installation was successful
         if ("Successfully installed" in logs or 
                 all(f"Requirement already satisfied: {lib}" in logs 
@@ -139,33 +140,17 @@ def execute_python_code(code: str, libraries_needed: Optional[List[str]] = None)
         container = docker_client.containers.run(
             config.DOCKER_IMAGE_NAME,
             command=["python", container_script_path],
-            volumes={script_dir: {'bind': '/app', 'mode': 'rw'}}, # Mount the directory containing the script
+            volumes={script_dir: {'bind': '/app', 'mode': 'rw'}},
             working_dir="/app",
             stderr=True,
             stdout=True,
-            detach=False,  # Run and wait for completion
-            remove=True,  # Remove container after execution
-            # Consider network_disabled=True for extra security if code doesn't need internet
+            detach=False,
+            remove=True,
+            #  network_disabled=True for extra security if code doesn't need internet
         )
-        # Logs are combined if detach=False and container is removed.
-        # For separate stdout/stderr, you might need to stream logs or inspect container before removal.
-        # However, for simplicity, `container.logs()` gives combined output.
-        # If using `detach=True` and `container.wait()`:
-        # stdout = container.logs(stdout=True, stderr=False).decode('utf-8')
-        # stderr = container.logs(stdout=False, stderr=True).decode('utf-8')
-
-        # For `detach=False` (synchronous run), the result of `run` is the logs if `remove=True` immediately
-        # Let's get logs before it's auto-removed, or trust the output from the run command.
-        # The `container` object here *is* the logs if `remove=True` and not detached.
-        output_bytes = container  # This is the logs if remove=True
+        output_bytes = container
         output_str = output_bytes.decode('utf-8')
 
-        # A simple way to differentiate stdout/stderr is to have the script print markers,
-        # or structure its output (e.g., JSON with 'stdout' and 'stderr' keys).
-        # For now, we treat all output as potential stdout and will rely on script exit code (implicitly via ContainerError).
-
-        # This is a simplification. `docker.errors.ContainerError` will be raised if script exits non-zero.
-        # If no error, all output is considered stdout.
         os.remove(abs_script_path)  # Clean up temp file
         return {"status": "success", "stdout": output_str, "stderr": ""}
 
@@ -242,7 +227,7 @@ def search_tavily(query: str, search_depth: str = "basic", max_results: int = 3)
 
 def search_brave(query: str) -> List[Dict[str, Any]]:
     """Searches Brave for the given query and returns a list of results.
-    
+
     Args:
         query (str): The search query.
 
