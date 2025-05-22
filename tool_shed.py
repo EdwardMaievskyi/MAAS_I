@@ -119,7 +119,6 @@ def execute_python_code(code: str, libraries_needed: Optional[List[str]] = None)
         return {"status": "failure", "stdout": "", "stderr": "Docker image not ready or Docker not running."}
 
     # Prepare the code: if libraries are needed, prepend pip install commands
-    # This ensures libraries are installed fresh for each execution, providing better isolation.
     final_code_to_run = ""
     if libraries_needed:
         install_commands = "\n".join([f"import subprocess; subprocess.run(['pip', 'install', '{lib}'], check=True)" for lib in libraries_needed])
@@ -136,7 +135,9 @@ def execute_python_code(code: str, libraries_needed: Optional[List[str]] = None)
     script_dir = os.path.dirname(abs_script_path)
     container_script_path = f"/app/{temp_script_name}"
 
+    container = None
     try:
+        # Run the container with the script mounted
         container = docker_client.containers.run(
             config.DOCKER_IMAGE_NAME,
             command=["python", container_script_path],
@@ -144,26 +145,67 @@ def execute_python_code(code: str, libraries_needed: Optional[List[str]] = None)
             working_dir="/app",
             stderr=True,
             stdout=True,
-            detach=False,
-            remove=True,
-            #  network_disabled=True for extra security if code doesn't need internet
+            detach=True,  # Run in background
+            remove=False  # Don't auto-remove so we can get logs
         )
-        output_bytes = container
-        output_str = output_bytes.decode('utf-8')
 
-        os.remove(abs_script_path)  # Clean up temp file
-        return {"status": "success", "stdout": output_str, "stderr": ""}
+        # Wait for container to finish with timeout
+        exit_code = container.wait(timeout=config.DOCKER_CONTAINER_TIMEOUT)["StatusCode"]
+
+        # Get logs
+        stdout_log = container.logs(stdout=True, stderr=False).decode('utf-8')
+        stderr_log = container.logs(stdout=False, stderr=True).decode('utf-8')
+
+        # Clean up
+        try:
+            container.remove()
+        except Exception as e:
+            print(f"TOOL_SHED: Warning - Could not remove container: {e}")
+
+        if os.path.exists(abs_script_path):
+            os.remove(abs_script_path)
+
+        if exit_code == 0:
+            return {"status": "success", "stdout": stdout_log, "stderr": stderr_log}
+        else:
+            return {"status": "failure", "stdout": stdout_log, "stderr": stderr_log}
 
     except docker.errors.ContainerError as e:
         # This typically means the Python script had an error (exit code > 0)
-        stdout_log = e.container.logs(stdout=True, stderr=False).decode('utf-8')
-        stderr_log = e.container.logs(stdout=False, stderr=True).decode('utf-8')
-        print(f"TOOL_SHED: ContainerError during code execution. Stdout: {stdout_log}, Stderr: {stderr_log}")
-        if os.path.exists(abs_script_path): os.remove(abs_script_path)
+        stdout_log = ""
+        stderr_log = str(e)
+
+        if container:
+            try:
+                stdout_log = container.logs(stdout=True, stderr=False).decode('utf-8')
+                stderr_log = container.logs(stdout=False, stderr=True).decode('utf-8')
+                container.remove()
+            except Exception as container_e:
+                print(f"TOOL_SHED: Error getting logs or removing container: {container_e}")
+
+        if os.path.exists(abs_script_path):
+            os.remove(abs_script_path)
+
         return {"status": "failure", "stdout": stdout_log, "stderr": stderr_log}
+
+    except docker.errors.NotFound as e:
+        # Container not found - could happen if Docker removed it
+        print(f"TOOL_SHED: Container not found error: {e}")
+        if os.path.exists(abs_script_path):
+            os.remove(abs_script_path)
+        return {"status": "failure", "stdout": "", "stderr": f"Docker container error: {str(e)}"}
+
     except Exception as e:
         print(f"TOOL_SHED: Exception during code execution: {e}")
-        if os.path.exists(abs_script_path): os.remove(abs_script_path)
+        if container:
+            try:
+                container.remove()
+            except Exception:
+                pass  # Already gone or can't be removed
+
+        if os.path.exists(abs_script_path):
+            os.remove(abs_script_path)
+
         return {"status": "failure", "stdout": "", "stderr": str(e)}
 
 

@@ -97,47 +97,67 @@ def task_router_node(state: AgentState) -> AgentState:
         print("ROUTER: Plan complete. Proceeding to final response.")
         state.next_node_to_call = "final_response_node"
         state.current_task_id = None
+
+    # At the beginning of the function
+    valid_destinations = list(AGENT_ACTION_MAP.keys()) + ["orchestrator_planner", "final_response_node"]
+    
+    # Before returning state with next_node_to_call
+    if state.next_node_to_call not in valid_destinations and state.next_node_to_call != "__end__":
+        print(f"ROUTER WARNING: Invalid destination '{state.next_node_to_call}'. Defaulting to final_response_node.")
+        state.error_message = f"Routing error: Invalid destination '{state.next_node_to_call}'."
+        state.next_node_to_call = "final_response_node"
+    
     return state
 
 
 def create_graph():
     workflow = StateGraph(AgentState)
 
+    # Add all nodes
     workflow.add_node("orchestrator_planner", orchestrator_planner_node)
     workflow.add_node("task_router", task_router_node)
+    workflow.add_node("final_response_node", final_response_node)
 
     for agent, actions in AGENT_ACTION_MAP.items():
         for action, node_func in actions.items():
             workflow.add_node(f"{agent}_{action}", node_func)
 
-    workflow.add_node("final_response_node", final_response_node)
-
+    # Set entry point
     workflow.set_entry_point("orchestrator_planner")
 
+    # Add basic edges
     workflow.add_edge("orchestrator_planner", "task_router")
-
-    def route_logic(state: AgentState):
-        if state.next_node_to_call == "__end__":
-            return END
-        return state.next_node_to_call
-
+    
+    # Add edges from agent nodes back to router
     for agent, actions in AGENT_ACTION_MAP.items():
         for action in actions.keys():
             workflow.add_edge(f"{agent}_{action}", "task_router")
 
+    # Define conditional routing logic
+    def route_logic(state: AgentState):
+        destination = state.next_node_to_call if state.next_node_to_call != "__end__" else END
+        print(f"ROUTER DEBUG: Routing from 'task_router' to '{destination}'")
+        return destination
+
+    # Add conditional edges from router to all possible destinations
     workflow.add_conditional_edges(
         "task_router",
         route_logic,
         {
+            # Map all agent actions
             **{f"{agent}_{action}": f"{agent}_{action}"
                for agent, actions in AGENT_ACTION_MAP.items()
                for action in actions.keys()},
+            # Add specific nodes
+            "orchestrator_planner": "orchestrator_planner",  # This is the key fix
             "final_response_node": "final_response_node",
             END: END
         }
     )
 
+    # Add final edge
     workflow.add_edge("final_response_node", END)
 
+    # Compile and return
     app = workflow.compile()
     return app

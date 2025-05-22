@@ -1,7 +1,7 @@
 
 # MAAS-I: Multi-Agent Assistance System
 
-This project implements a multi-agent system that can handle complex user requests by breaking them down into a series of coordinated tasks executed by specialized agents. Below you can find a summary of what has been achieved.
+This project implements a multi-agent system that can handle complex user requests by breaking them down into a series of coordinated tasks executed by specialized agents. GUI was created using Gradio and simplifies communication with agents for the end-user. Below you can find a summary of what has been achieved.
 
 ## Core Architecture
 
