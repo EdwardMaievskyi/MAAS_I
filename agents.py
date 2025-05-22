@@ -2,10 +2,13 @@ import json
 import uuid
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
+from typing import List, Dict
+import pandas as pd
 
 import config
-from state_model import AgentState, Task
-from tool_shed import SEARCH_FUNCTION_MAP, execute_python_code, install_libraries
+from state_model import AgentState, Task, FinancialData, CompanyInfo
+from tool_shed import SEARCH_FUNCTION_MAP, \
+    execute_python_code, install_libraries
 
 # Initialize LLMs
 orchestrator_llm = ChatOpenAI(model=config.ORCHESTRATOR_LLM_MODEL,
@@ -48,12 +51,32 @@ Available agents and their actions:
     -   action: "execute_code"
         details: {{"code": "python code string OR 'use_generated_code' if generated in a previous step", "relevant_libraries": ["lib1", "lib2"] (optional, if specific libs from an install step are crucial for this execution run)}}
         (Executes Python code. If "code" is "use_generated_code", it uses the output from the last "generate_code" action. The 'relevant_libraries' will be passed to the execution environment to ensure they are installed before running the code.)
+3.  FinancialDataAgent:
+    -   action: "retrieve_stock_prices"
+        details: {{"request_type": "stock_price", "tickers": ["AAPL", "MSFT"], "time_period": {{"start": "2023-01-01", "end": "2023-12-31"}}}}
+        (Retrieves current or historical stock prices for specified tickers.)
+    -   action: "retrieve_company_info"
+        details: {{"request_type": "company_info", "tickers": ["AAPL", "MSFT"]}}
+        (Retrieves company information like sector, industry, and description.)
+    -   action: "retrieve_financial_ratios"
+        details: {{"request_type": "financial_ratios", "tickers": ["AAPL"], "metrics": ["pe_ratio", "dividend_yield"]}}
+        (Retrieves financial ratios and metrics. Available metrics: pe_ratio, forward_pe, peg_ratio, price_to_book, dividend_yield, profit_margin, return_on_equity, beta, eps.)
+    -   action: "retrieve_market_data"
+        details: {{"request_type": "market_data", "metrics": ["gdp", "inflation"], "time_period": {{"start": "2020-01-01"}}}}
+        (Retrieves market-wide economic data. Available metrics: gdp, inflation, unemployment, interest_rate, consumer_sentiment, retail_sales, industrial_production, housing_starts.)
+    -   action: "retrieve_news"
+        details: {{"request_type": "news_analysis", "tickers": ["AAPL"]}}
+        (Retrieves and analyzes recent news for specified tickers.)
+    -   action: "retrieve_historical_data"
+        details: {{"request_type": "historical_stock_data", "tickers": ["AAPL"], "time_period": {{"start": "2023-01-01", "end": "2023-12-31"}}}}
+        (Retrieves detailed historical data for analysis, including open, high, low, close prices and volume.)
 
 User Request: "{user_request}"
 {previous_steps_summary}
 
 Based on the request and any previous errors, create a JSON list of tasks. Each task should have "id", "agent_name", "action", and "details".
 Ensure IDs are unique for new tasks.
+Not all agents and actions are needed for every request. Plan and optimize appropriately. Feel free to combine information from multiple agents if needed.
 If the user request is a simple question that can be answered directly, you can create a plan with a single task for yourself:
     {{ "id": "{create_task_id()}", "agent_name": "OrchestratorAgent", "action": "direct_answer", "details": {{"answer_prompt": "Formulate an answer for: {user_request}"}} }}
 
@@ -63,6 +86,13 @@ Example Plan:
     {{"id": "{create_task_id()}", "agent_name": "CodeAgent", "action": "generate_code", "details": {{"prompt": "Write a python script to parse search results and print the version.", "context_data": " risultati_ricerca "}}}},
     {{"id": "{create_task_id()}", "agent_name": "CodeAgent", "action": "execute_code", "details": {{"code": "use_generated_code"}}}}
 ]
+
+For financial requests, use the FinancialDataAgent. Example:
+[
+    {{"id": "{create_task_id()}", "agent_name": "FinancialDataAgent", "action": "retrieve_stock_prices", "details": {{"request_type": "stock_price", "tickers": ["AAPL"], "time_period": {{"start": "2023-01-01", "end": "2023-12-31"}}}}}},
+    {{"id": "{create_task_id()}", "agent_name": "FinancialDataAgent", "action": "retrieve_company_info", "details": {{"request_type": "company_info", "tickers": ["AAPL"]}}}}
+]
+
 Output only the JSON plan.
 """
     messages = [SystemMessage(content=prompt)]
@@ -205,7 +235,7 @@ def search_agent_node(state: AgentState) -> AgentState:
             print(f"AGENT: SearchAgent - Unknown search tool: {tool_name}")
             tool_errors[tool_name] = "Unknown search tool."
             continue
-        
+
         try:
             results = search_function(query)
             if results and not any(res.get("error") for res in results): # Check if results are not errors themselves
@@ -365,3 +395,399 @@ def code_agent_executor_node(state: AgentState) -> AgentState:
 
     state.next_node_to_call = "task_router"
     return state
+
+
+def financial_data_agent_node(state: AgentState) -> AgentState:
+    """Retrieves and analyzes financial data based on the current task."""
+    print("AGENT: FinancialDataAgent - Retrieving financial data...")
+    current_task = next((task for task in state.plan if task.id == state.current_task_id), None)
+    
+    if not current_task:
+        state.error_message = "FinancialDataAgent: No current task found."
+        state.next_node_to_call = "task_router"
+        return state
+    
+    # Extract request details
+    request_type = current_task.details.get("request_type")
+    ticker_symbols = current_task.details.get("tickers", [])
+    time_period = current_task.details.get("time_period", {})
+    metrics = current_task.details.get("metrics", [])
+    
+    if not request_type:
+        current_task.status = "failed"
+        current_task.error = "No financial data request type specified."
+        state.next_node_to_call = "task_router"
+        return state
+    
+    # Initialize results containers if not already present
+    if state.financial_data_result is None:
+        state.financial_data_result = []
+    if state.company_info_result is None:
+        state.company_info_result = []
+    
+    # Process based on request type
+    try:
+        if request_type == "stock_price":
+            _retrieve_stock_prices(state, ticker_symbols, time_period)
+        elif request_type == "company_info":
+            _retrieve_company_info(state, ticker_symbols)
+        elif request_type == "financial_ratios":
+            _retrieve_financial_ratios(state, ticker_symbols, metrics)
+        elif request_type == "market_data":
+            _retrieve_market_data(state, metrics, time_period)
+        elif request_type == "news_analysis":
+            _retrieve_and_analyze_news(state, ticker_symbols)
+        elif request_type == "historical_stock_data":
+            _retrieve_historical_data(state, ticker_symbols, time_period)
+        else:
+            current_task.status = "failed"
+            current_task.error = f"Unknown financial data request type: {request_type}"
+            state.next_node_to_call = "task_router"
+            return state
+        
+        # If we got here, the request was processed
+        current_task.status = "completed"
+        
+        # Create a summary of the data retrieved
+        summary = _create_financial_data_summary(state)
+        current_task.result = {"summary": summary}
+        
+        print(f"AGENT: FinancialDataAgent - Successfully retrieved {request_type} data")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()  # Print the full stack trace for debugging
+        current_task.status = "failed"
+        current_task.error = f"Error retrieving financial data: {str(e)}"
+        print(f"AGENT: FinancialDataAgent - Error: {e}")
+    
+    state.next_node_to_call = "task_router"
+    return state
+
+
+def _retrieve_stock_prices(state: AgentState, tickers: List[str], time_period: Dict[str, str]) -> None:
+    """Retrieves current or historical stock prices."""
+    from tool_shed import get_historical_yahoo_finance_stock_data
+    
+    start_date = time_period.get("start", None)
+    end_date = time_period.get("end", None)
+    
+    for ticker in tickers:
+        try:
+            data = get_historical_yahoo_finance_stock_data(ticker, start_date, end_date)
+            
+            # Check if we got an error
+            if isinstance(data, list) and len(data) > 0 and "error" in data[0]:
+                raise Exception(data[0]["error"])
+            
+            # Process the data into our standard format
+            if "Close" in data:
+                close_prices = data["Close"]
+                dates = list(close_prices.keys())
+                values = list(close_prices.values())
+                
+                # Create time series data
+                series_data = [{"date": str(date), "value": value} for date, value in zip(dates, values)]
+                
+                # Calculate average if we have data
+                avg_price = sum(values) / len(values) if values else None
+                
+                # Add to financial data results
+                state.financial_data_result.append(
+                    FinancialData(
+                        name=f"{ticker} Stock Price",
+                        ticker=ticker,
+                        value=avg_price,
+                        unit="USD",
+                        series=series_data,
+                        source="Yahoo Finance"
+                    )
+                )
+        except Exception as e:
+            print(f"Error retrieving stock price for {ticker}: {e}")
+            # Add error entry
+            state.financial_data_result.append(
+                FinancialData(
+                    name=f"{ticker} Stock Price",
+                    ticker=ticker,
+                    value=None,
+                    unit="USD",
+                    source="Yahoo Finance",
+                    series=[]
+                )
+            )
+
+
+def _retrieve_company_info(state: AgentState, tickers: List[str]) -> None:
+    """Retrieves company information for the specified tickers."""
+    import yfinance as yf
+    
+    for ticker in tickers:
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            info = ticker_obj.info
+            
+            # Create company info object
+            company_info = CompanyInfo(
+                symbol=ticker,
+                name=info.get("shortName", info.get("longName", ticker)),
+                sector=info.get("sector"),
+                industry=info.get("industry"),
+                market_cap=info.get("marketCap"),
+                description=info.get("longBusinessSummary")
+            )
+            
+            state.company_info_result.append(company_info)
+            
+            # Also add a financial data entry for market cap
+            if info.get("marketCap"):
+                state.financial_data_result.append(
+                    FinancialData(
+                        name=f"{ticker} Market Cap",
+                        ticker=ticker,
+                        value=info.get("marketCap"),
+                        unit="USD",
+                        source="Yahoo Finance"
+                    )
+                )
+        except Exception as e:
+            print(f"Error retrieving company info for {ticker}: {e}")
+            # Add empty company info
+            state.company_info_result.append(
+                CompanyInfo(
+                    symbol=ticker,
+                    name=ticker
+                )
+            )
+
+
+def _retrieve_financial_ratios(state: AgentState, tickers: List[str], metrics: List[str]) -> None:
+    """Retrieves financial ratios for the specified tickers."""
+    import yfinance as yf
+    
+    # Map of metric names to their keys in yfinance
+    metric_map = {
+        "pe_ratio": "trailingPE",
+        "forward_pe": "forwardPE",
+        "peg_ratio": "pegRatio",
+        "price_to_book": "priceToBook",
+        "dividend_yield": "dividendYield",
+        "profit_margin": "profitMargins",
+        "return_on_equity": "returnOnEquity",
+        "beta": "beta",
+        "eps": "trailingEps"
+    }
+    
+    # If no specific metrics requested, use all
+    if not metrics:
+        metrics = list(metric_map.keys())
+    
+    for ticker in tickers:
+        try:
+            ticker_obj = yf.Ticker(ticker)
+            info = ticker_obj.info
+            
+            for metric in metrics:
+                yf_key = metric_map.get(metric)
+                if not yf_key or yf_key not in info:
+                    continue
+                
+                value = info[yf_key]
+                unit = "%" if metric in ["dividend_yield", "profit_margin", "return_on_equity"] else ""
+                
+                state.financial_data_result.append(
+                    FinancialData(
+                        name=f"{ticker} {metric.replace('_', ' ').title()}",
+                        ticker=ticker,
+                        value=value,
+                        unit=unit,
+                        source="Yahoo Finance"
+                    )
+                )
+        except Exception as e:
+            print(f"Error retrieving financial ratios for {ticker}: {e}")
+
+
+def _retrieve_market_data(state: AgentState, metrics: List[str], time_period: Dict[str, str]) -> None:
+    """Retrieves market-wide economic data."""
+    from tool_shed import get_fred_index_data
+    
+    # Map of common economic indicators to their FRED codes
+    fred_indicators = {
+        "gdp": "GDP",
+        "inflation": "CPIAUCSL",
+        "unemployment": "UNRATE",
+        "interest_rate": "FEDFUNDS",
+        "consumer_sentiment": "UMCSENT",
+        "retail_sales": "RSXFS",
+        "industrial_production": "INDPRO",
+        "housing_starts": "HOUST"
+    }
+    
+    # If no specific metrics requested, use a default set
+    if not metrics:
+        metrics = ["gdp", "inflation", "unemployment", "interest_rate"]
+    
+    start_date = time_period.get("start", "2020-01-01")
+    end_date = time_period.get("end", None)
+    
+    for metric in metrics:
+        if metric not in fred_indicators:
+            continue
+            
+        fred_code = fred_indicators[metric]
+        try:
+            data = get_fred_index_data(fred_code, start_date, end_date)
+            
+            # Check if we got an error
+            if isinstance(data, list) and len(data) > 0 and "error" in data[0]:
+                raise Exception(data[0]["error"])
+            
+            # Process the data
+            dates = list(data.keys())
+            values = list(data.values())
+            
+            # Create time series data
+            series_data = [{"date": str(date), "value": value} for date, value in zip(dates, values)]
+            
+            # Calculate latest value
+            latest_value = values[-1] if values else None
+            
+            # Determine unit based on metric
+            unit = "%" if metric in ["inflation", "unemployment", "interest_rate"] else ""
+            
+            # Add to financial data results
+            state.financial_data_result.append(
+                FinancialData(
+                    name=f"{metric.replace('_', ' ').title()}",
+                    value=latest_value,
+                    unit=unit,
+                    series=series_data,
+                    source="FRED"
+                )
+            )
+        except Exception as e:
+            print(f"Error retrieving {metric} data: {e}")
+
+
+def _retrieve_and_analyze_news(state: AgentState, tickers: List[str]) -> None:
+    """Retrieves and analyzes news for the specified tickers."""
+    from tool_shed import get_yahoo_finance_news
+    
+    for ticker in tickers:
+        try:
+            news_data = get_yahoo_finance_news(ticker)
+            
+            # Check if we got an error
+            if isinstance(news_data, list) and len(news_data) > 0 and "error" in news_data[0]:
+                raise Exception(news_data[0]["error"])
+            
+            # Process news data
+            news_items = []
+            for item in news_data:
+                news_items.append({
+                    "title": item.get("title", ""),
+                    "link": item.get("link", ""),
+                    "publisher": item.get("publisher", ""),
+                    "published_date": item.get("published_date", "")
+                })
+            
+            # Add to financial data results
+            state.financial_data_result.append(
+                FinancialData(
+                    name=f"{ticker} News",
+                    ticker=ticker,
+                    news=news_items,
+                    source="Yahoo Finance News"
+                )
+            )
+        except Exception as e:
+            print(f"Error retrieving news for {ticker}: {e}")
+
+
+def _retrieve_historical_data(state: AgentState, tickers: List[str], time_period: Dict[str, str]) -> None:
+    """Retrieves detailed historical data for analysis."""
+    # This is similar to _retrieve_stock_prices but with more metrics
+    from tool_shed import get_historical_yahoo_finance_stock_data
+    
+    start_date = time_period.get("start", None)
+    end_date = time_period.get("end", None)
+    
+    for ticker in tickers:
+        try:
+            data = get_historical_yahoo_finance_stock_data(ticker, start_date, end_date)
+            
+            # Check if we got an error
+            if isinstance(data, list) and len(data) > 0 and "error" in data[0]:
+                raise Exception(data[0]["error"])
+            
+            # Process the data for multiple metrics
+            metrics = ["Open", "High", "Low", "Close", "Volume"]
+            
+            for metric in metrics:
+                if metric not in data:
+                    continue
+                    
+                metric_data = data[metric]
+                dates = list(metric_data.keys())
+                values = list(metric_data.values())
+                
+                # Create time series data
+                series_data = [{"date": str(date), "value": value} for date, value in zip(dates, values)]
+                
+                # Calculate average
+                avg_value = sum(values) / len(values) if values else None
+                
+                # Determine unit
+                unit = "USD" if metric != "Volume" else "Shares"
+                
+                # Add to financial data results
+                state.financial_data_result.append(
+                    FinancialData(
+                        name=f"{ticker} {metric}",
+                        ticker=ticker,
+                        value=avg_value,
+                        unit=unit,
+                        series=series_data,
+                        source="Yahoo Finance"
+                    )
+                )
+        except Exception as e:
+            print(f"Error retrieving historical data for {ticker}: {e}")
+
+
+def _create_financial_data_summary(state: AgentState) -> str:
+    """Creates a summary of the financial data retrieved."""
+    summary = []
+    
+    # Summarize company info
+    if state.company_info_result:
+        summary.append(f"Retrieved company information for {len(state.company_info_result)} companies.")
+        for company in state.company_info_result:
+            if company.name and company.symbol:
+                summary.append(f"- {company.name} ({company.symbol})")
+                if company.sector:
+                    summary.append(f"  Sector: {company.sector}")
+                if company.industry:
+                    summary.append(f"  Industry: {company.industry}")
+    
+    # Summarize financial data
+    if state.financial_data_result:
+        data_by_ticker = {}
+        for data in state.financial_data_result:
+            ticker = data.ticker if data.ticker else "Market"
+            if ticker not in data_by_ticker:
+                data_by_ticker[ticker] = []
+            data_by_ticker[ticker].append(data)
+        
+        summary.append(f"\nRetrieved {len(state.financial_data_result)} financial metrics:")
+        for ticker, data_list in data_by_ticker.items():
+            summary.append(f"- {ticker}:")
+            for data in data_list:
+                value_str = f"{data.value} {data.unit}" if data.value is not None else "N/A"
+                summary.append(f"  • {data.name}: {value_str}")
+                if data.series:
+                    summary.append(f"    (Time series with {len(data.series)} data points)")
+                if data.news:
+                    summary.append(f"    (Retrieved {len(data.news)} news articles)")
+    
+    return "\n".join(summary)

@@ -7,7 +7,8 @@ from agents import (
     code_agent_installer_node,
     code_agent_generator_node,
     code_agent_executor_node,
-    final_response_node
+    final_response_node,
+    financial_data_agent_node
 )
 
 # Mapping actions to agent node functions
@@ -22,6 +23,14 @@ AGENT_ACTION_MAP = {
         "install_libraries": code_agent_installer_node,
         "generate_code": code_agent_generator_node,
         "execute_code": code_agent_executor_node,
+    },
+    "FinancialDataAgent": {
+        "retrieve_stock_prices": financial_data_agent_node,
+        "retrieve_company_info": financial_data_agent_node,
+        "retrieve_financial_ratios": financial_data_agent_node,
+        "retrieve_market_data": financial_data_agent_node,
+        "retrieve_news": financial_data_agent_node,
+        "retrieve_historical_data": financial_data_agent_node,
     }
 }
 
@@ -82,11 +91,19 @@ def task_router_node(state: AgentState) -> AgentState:
         agent_name = next_pending_task.agent_name
         action_name = next_pending_task.action
 
-        if agent_name in AGENT_ACTION_MAP and action_name in AGENT_ACTION_MAP[agent_name]:
-            state.next_node_to_call = f"{agent_name}_{action_name}"
+        # Validate the destination before setting it
+        node_name = f"{agent_name}_{action_name}"
+        valid_destinations = set()
+        for a, actions in AGENT_ACTION_MAP.items():
+            for act in actions.keys():
+                valid_destinations.add(f"{a}_{act}")
+        valid_destinations.update(["orchestrator_planner", "final_response_node", "__end__"])
+        
+        if node_name in valid_destinations:
+            state.next_node_to_call = node_name
             print(f"ROUTER: Routing to task ID {state.current_task_id} -> Node '{state.next_node_to_call}'")
         else:
-            print(f"ROUTER: Unknown agent/action: {agent_name}/{action_name}. Ending.")
+            print(f"ROUTER WARNING: Invalid destination '{node_name}'. Defaulting to final_response_node.")
             state.error_message = f"Router error: Unknown agent or action '{agent_name}/{action_name}'."
             state.next_node_to_call = "final_response_node"  # Go to finalize with error
             if state.current_task_id:
@@ -97,16 +114,6 @@ def task_router_node(state: AgentState) -> AgentState:
         print("ROUTER: Plan complete. Proceeding to final response.")
         state.next_node_to_call = "final_response_node"
         state.current_task_id = None
-
-    # At the beginning of the function
-    valid_destinations = list(AGENT_ACTION_MAP.keys()) + ["orchestrator_planner", "final_response_node"]
-    
-    # Before returning state with next_node_to_call
-    if state.next_node_to_call not in valid_destinations and state.next_node_to_call != "__end__":
-        print(f"ROUTER WARNING: Invalid destination '{state.next_node_to_call}'. Defaulting to final_response_node.")
-        state.error_message = f"Routing error: Invalid destination '{state.next_node_to_call}'."
-        state.next_node_to_call = "final_response_node"
-    
     return state
 
 
@@ -118,9 +125,12 @@ def create_graph():
     workflow.add_node("task_router", task_router_node)
     workflow.add_node("final_response_node", final_response_node)
 
+    # Add all agent action nodes
     for agent, actions in AGENT_ACTION_MAP.items():
         for action, node_func in actions.items():
-            workflow.add_node(f"{agent}_{action}", node_func)
+            node_name = f"{agent}_{action}"
+            print(f"Registering node: {node_name}")
+            workflow.add_node(node_name, node_func)
 
     # Set entry point
     workflow.set_entry_point("orchestrator_planner")
@@ -131,7 +141,8 @@ def create_graph():
     # Add edges from agent nodes back to router
     for agent, actions in AGENT_ACTION_MAP.items():
         for action in actions.keys():
-            workflow.add_edge(f"{agent}_{action}", "task_router")
+            node_name = f"{agent}_{action}"
+            workflow.add_edge(node_name, "task_router")
 
     # Define conditional routing logic
     def route_logic(state: AgentState):
@@ -139,24 +150,51 @@ def create_graph():
         print(f"ROUTER DEBUG: Routing from 'task_router' to '{destination}'")
         return destination
 
+    # Create a mapping of all possible destinations
+    destinations = {}
+    
+    # Add all agent action nodes to destinations
+    for agent, actions in AGENT_ACTION_MAP.items():
+        for action in actions.keys():
+            node_name = f"{agent}_{action}"
+            destinations[node_name] = node_name
+            
+    # Add special nodes
+    destinations["orchestrator_planner"] = "orchestrator_planner"
+    destinations["final_response_node"] = "final_response_node"
+    destinations[END] = END
+    
+    # Print all registered destinations for debugging
+    print("Registered destinations:")
+    for dest in destinations:
+        print(f"  - {dest}")
+
     # Add conditional edges from router to all possible destinations
     workflow.add_conditional_edges(
         "task_router",
         route_logic,
-        {
-            # Map all agent actions
-            **{f"{agent}_{action}": f"{agent}_{action}"
-               for agent, actions in AGENT_ACTION_MAP.items()
-               for action in actions.keys()},
-            # Add specific nodes
-            "orchestrator_planner": "orchestrator_planner",  # This is the key fix
-            "final_response_node": "final_response_node",
-            END: END
-        }
+        destinations
     )
 
     # Add final edge
     workflow.add_edge("final_response_node", END)
+
+    # Validate the graph
+    print("Validating graph...")
+    all_nodes = set(workflow.nodes.keys())
+    all_nodes.add(END)  # Add the special END node
+    
+    # Check all agent actions
+    for agent, actions in AGENT_ACTION_MAP.items():
+        for action in actions.keys():
+            node_name = f"{agent}_{action}"
+            if node_name not in all_nodes:
+                print(f"WARNING: Node '{node_name}' referenced but not registered")
+    
+    # Check special nodes
+    for special_node in ["orchestrator_planner", "task_router", "final_response_node"]:
+        if special_node not in all_nodes:
+            print(f"WARNING: Special node '{special_node}' referenced but not registered")
 
     # Compile and return
     app = workflow.compile()

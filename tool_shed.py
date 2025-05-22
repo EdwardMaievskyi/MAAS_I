@@ -1,13 +1,23 @@
 import docker
 import time
 import os
+from datetime import date, timedelta, datetime
 from duckduckgo_search import DDGS
+from fredapi import Fred
+from functools import lru_cache
 from tavily import TavilyClient
 from langchain_community.utilities import SerpAPIWrapper
 from langchain_community.tools import BraveSearch
-from typing import List, Dict, Any, Optional
+from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
+from langchain.tools import Tool
+from langchain_community.tools.yahoo_finance_news import YahooFinanceNewsTool
+from typing import List, Dict, Any, Optional, Union
+import yfinance as yf
+import pandas as pd
 
 import config
+
+YESTERDAY = (date.today() - timedelta(days=1)).strftime('%Y-%m-%d')
 
 # --- Docker Utilities ---
 docker_client = None
@@ -114,7 +124,15 @@ def install_libraries(libraries: List[str]) -> Dict[str, Any]:
 
 
 def execute_python_code(code: str, libraries_needed: Optional[List[str]] = None) -> Dict[str, Any]:
-    """Executes Python code in an isolated Docker container."""
+    """Executes Python code in an isolated Docker container.
+
+    Args:
+        code (str): The Python code to execute.
+        libraries_needed (Optional[List[str]]): A list of libraries to install before running the code.
+
+    Returns:
+        Dict[str, Any]: A dictionary containing the status, stdout, and stderr of the code execution.
+    """
     if not IS_DOCKER_IMAGE_READY or not docker_client:
         return {"status": "failure", "stdout": "", "stderr": "Docker image not ready or Docker not running."}
 
@@ -267,6 +285,18 @@ def search_tavily(query: str, search_depth: str = "basic", max_results: int = 3)
         return [{"error": str(e), "source": "Tavily"}]
 
 
+def search_wikipedia(query: str) -> List[Dict[str, Any]]:
+    """Searches Wikipedia for the given query."""
+    print(f"TOOL_SHED: Searching Wikipedia for: '{query}'")
+    try:
+        wikipedia = WikipediaAPIWrapper()
+        results = wikipedia.run(query)
+        return [{"content": results, "source": "Wikipedia"}]
+    except Exception as e:
+        print(f"TOOL_SHED: Wikipedia search error: {e}")
+        return [{"error": str(e), "source": "Wikipedia"}]
+
+
 def search_brave(query: str) -> List[Dict[str, Any]]:
     """Searches Brave for the given query and returns a list of results.
 
@@ -317,4 +347,96 @@ SEARCH_FUNCTION_MAP = {
     "Tavily": search_tavily,
     "BraveSearch": search_brave,
     "SerpAPI": search_serpapi,
+    "Wikipedia": search_wikipedia,
+}
+
+
+# Financial Data Retrieving Agent specific tools
+def get_yahoo_finance_news(ticker_symbol: str) -> List[Dict[str, Any]]:
+    """Gets news from Yahoo Finance for the given ticker symbol (i.e. an 
+    abbreviation used to uniquely identify publicly traded shares of a 
+    particular stock or security on a particular stock exchange)."""
+    print(f"TOOL_SHED: Getting Yahoo Finance news for: '{ticker_symbol}'")
+    try:
+        news_tool = YahooFinanceNewsTool(ticker_symbol)
+        results = news_tool.invoke()
+        return results
+    except Exception as e:
+        print(f"TOOL_SHED: Yahoo Finance News error: {e}")
+        return [{"error": str(e), "source": "Yahoo Finance News"}]
+
+
+@lru_cache(maxsize=16)
+def get_fred_index_data(economical_index: str,
+                        start_date: str = '1991-01-01',
+                        end_date: str = YESTERDAY) -> List[Dict[str, Any]]:
+    """Gets data from the Federal Reserve Bank of St. Louis (FRED) for the given 
+    economical index.
+    Args:
+        economical_index (str): The FRED series ID for the economical index.
+        start_date (str): The start date for data retrieval in the format YYYY-MM-DD.
+        end_date (str): The end date for data retrieval in the format YYYY-MM-DD.
+
+    Returns:
+        List[Dict[str, Any]]: A list of FRED data.
+    """
+    print(f"TOOL_SHED: Getting FRED data for: '{economical_index}'")
+    if not config.FRED_API_KEY:
+        print("TOOL_SHED: FRED API key not found.")
+        return [{"error": "FRED API key not configured", "source": "FRED"}]
+    try:
+        fred = Fred(api_key=config.FRED_API_KEY)
+        results = fred.get_series_latest_release(economical_index,
+                                                 start_date=start_date,
+                                                 end_date=end_date)
+        return results.to_dict()
+    except Exception as e:
+        print(f"TOOL_SHED: FRED data retrieval error: {e}")
+        return [{"error": str(e), "source": "FRED"}]
+
+
+def get_historical_yahoo_finance_stock_data(ticker_symbol: str, start_date: Optional[str] = None, end_date: Optional[str] = None) -> Dict[str, Any]:
+    """Retrieves historical stock data from Yahoo Finance."""
+    print(f"TOOL_SHED: Getting historical Yahoo Finance stock data for: '{ticker_symbol}'")
+    
+    # Default to last 7 days if no dates provided
+    if not start_date:
+        start_date = (date.today() - timedelta(days=7)).strftime('%Y-%m-%d')
+    if not end_date:
+        end_date = date.today().strftime('%Y-%m-%d')
+    
+    # Parse dates to ensure they're in the correct format
+    try:
+        parsed_start_date = datetime.strptime(start_date, '%Y-%m-%d').date()
+        parsed_end_date = datetime.strptime(end_date, '%Y-%m-%d').date()
+    except ValueError:
+        return [{"error": "Invalid date format. Use YYYY-MM-DD.", "source": "Yahoo Finance"}]
+    
+    if parsed_start_date >= parsed_end_date:
+        return [{"error": "Start date must be before end date", "source": "Yahoo Finance"}]
+
+    try:
+        ticker = yf.Ticker(ticker_symbol)
+        historical_data = ticker.history(
+            start=parsed_start_date,
+            end=parsed_end_date,
+            interval='1d'
+        )
+        
+        # Convert to dictionary format
+        result = {}
+        for column in historical_data.columns:
+            result[column] = historical_data[column].to_dict()
+            
+        return result
+
+    except Exception as e:
+        print(f"TOOL_SHED: Error fetching data for {ticker_symbol}: {e}")
+        return [{"error": str(e), "source": "Yahoo Finance"}]
+
+
+FINANCIAL_DATA_RETRIEVAL_TOOLS = {
+    "Yahoo Finance": get_historical_yahoo_finance_stock_data,
+    "Yahoo Finance News": get_yahoo_finance_news,
+    "FRED": get_fred_index_data
 }
