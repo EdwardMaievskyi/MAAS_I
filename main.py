@@ -193,10 +193,9 @@ class ChatInterface:
             # Add examples
             gr.Examples(
                 examples=[
-                    "What is an average price of BTC in the last 30 days?",
+                    "How much aviation fuel do I need to fly from YVR to YYC in bad weather conditions by Cessna 172 Skyhawk, and what will be its average cost?",
                     "Write a Python script to analyze sentiment in tweets",
-                    "Find information about the latest AI research and summarize it",
-                    "Create a data visualization of global CO2 emissions"
+                    "What's the average price of a used Toyota Camry 2018 - 2024 in Canada?"
                 ],
                 inputs=msg_box
             )
